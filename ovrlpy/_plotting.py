@@ -107,7 +107,6 @@ def plot_umap(ovrlp: Ovrlp, *, annotate: bool = True, ax: Axes | None = None, **
 
     Parameters
     ----------
-    ovrlp : ovrlpy.Ovrlp
     annotate : bool
         Whether to add cell-type annotation if it was calculated using `Ovrlp.fit_signatures`.
     ax : matplotlib.axes.Axes | None
@@ -179,7 +178,6 @@ def plot_tissue(
 
     Parameters
     ----------
-    ovrlp : ovrlpy.Ovrlp
     scalebar : dict[str, typing.Any] | None
         If `None` no scalebar will be plotted. Otherwise a dictionary with
         additional kwargs for ``matplotlib_scalebar.scalebar.ScaleBar``.
@@ -282,7 +280,7 @@ def plot_signal_integrity(
 
     Parameters
     ----------
-    ovrlp : ovrlpy.Ovrlp
+    ovrlp : Ovrlp
     signal_threshold : float, optional
         Threshold below which the signal is faded out in the plot,
         to avoid displaying noisy areas with low predictive confidence.
@@ -503,4 +501,179 @@ def plot_region_of_interest(
 
     fig.tight_layout()
 
+    return fig
+
+
+def plot_region_of_interest_with_polygons(
+    ovrlp,
+    gdf,
+    x: float,
+    y: float,
+    *,
+    window_size: int = 30,
+    signal_threshold: float = 2,
+    scalebar: dict = {"dx": 1, "units": "um"},
+    figsize: tuple = (12, 8),
+    **kwargs,
+) -> Figure:
+    """
+    Plot an overview of a zoomed-in region of interest with cell polygons overlaid.
+    
+    Parameters
+    ----------
+    ovrlp : Ovrlp
+        Ovrlp object containing the fitted model
+    gdf : geopandas.GeoDataFrame
+        GeoDataFrame with cell polygons
+    x : float
+        x coordinate of the region of interest
+    y : float
+        y coordinate of the region of interest
+    window_size : int, optional
+        Size of the window to display.
+    signal_threshold : float, optional
+        Threshold below which the signal is faded out in the VSI plot
+    scalebar : dict | None
+        Scalebar parameters
+    figsize : tuple
+        Size of the figure in inches.
+    kwargs
+        Other keyword arguments passed to plt.figure
+    
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    import matplotlib.patches as mpatches
+    from shapely.geometry import box
+    
+    integrity = ovrlp.integrity_map
+    signal = ovrlp.signal_map
+    embedding = ovrlp.pseudocells.obsm["2D_UMAP"]
+    
+    # Create region of interest box
+    roi_bounds = box(x - window_size, y - window_size, x + window_size, y + window_size)
+    
+    # Filter polygons within ROI
+    gdf_roi = gdf[gdf.geometry.intersects(roi_bounds)].copy()
+    
+    # Get transcripts and color them
+    roi_transcripts = ovrlp.subset_transcripts(x, y, window_size=window_size).sort("z")
+    _, embedding_color = ovrlp.transform_transcripts(roi_transcripts)
+    roi_transcripts = roi_transcripts.with_columns(RGB=embedding_color)
+    
+    roi = ((x - window_size, x + window_size), (y - window_size, y + window_size))
+    
+    fig = plt.figure(figsize=figsize, **kwargs)
+    gs = fig.add_gridspec(2, 3)
+    
+    # Integrity map
+    ax_integrity = fig.add_subplot(gs[0, 2], label="signal_integrity", facecolor="k")
+    img = _plot_signal_integrity(
+        ax_integrity, integrity, signal, signal_threshold, cmap=BIH_CMAP
+    )
+    fig.colorbar(img, label=VSI)
+    ax_integrity.set_title("ROI, signal integrity")
+    ax_integrity.set_xlim(x - window_size, x + window_size)
+    ax_integrity.set_ylim(y - window_size, y + window_size)
+    
+    # UMAP
+    ax_umap = fig.add_subplot(gs[0, 0], label="umap")
+    _plot_embeddings(ax_umap, embedding, ovrlp.pseudocells.obsm["RGB"])
+    ax_umap.set_title("UMAP")
+    
+    # Tissue map
+    ax_tissue_whole = fig.add_subplot(gs[0, 1], label="celltype_map")
+    plot_tissue(ovrlp, ax=ax_tissue_whole, s=1)
+    roi_box = Rectangle(
+        (x - window_size, y - window_size),
+        2 * window_size,
+        2 * window_size,
+        fill=False,
+        edgecolor="k",
+        linewidth=2,
+    )
+    ax_tissue_whole.add_artist(roi_box)
+    ax_tissue_whole.set_title("celltype map")
+    
+    # ============ TOP VIEW OF ROI WITH POLYGONS ============
+    roi_scatter_kwargs = dict(marker=".", alpha=0.8, s=1.5e5 / window_size**2)
+    
+    ax_roi_top = fig.add_subplot(gs[1, 0], label="top_map")
+    roi_top = roi_transcripts.filter(pl.col("z") > pl.col("z_center"))
+    _plot_tissue_scatter(
+        ax_roi_top,
+        roi_top["x"],
+        roi_top["y"],
+        roi_top["RGB"].to_numpy(),
+        title="ROI celltype map, top",
+        **roi_scatter_kwargs,
+    )
+    
+# Add polygons on top view
+    for idx, row in gdf_roi.iterrows():
+        geom = row.geometry
+        if geom.geom_type == 'Polygon':
+            x_coords, y_coords = geom.exterior.xy
+            ax_roi_top.plot(x_coords, y_coords, 'k-', linewidth=0.5, alpha=0.6)
+        elif geom.geom_type == 'MultiPolygon':
+            for poly in geom.geoms:
+                x_coords, y_coords = poly.exterior.xy
+                ax_roi_top.plot(x_coords, y_coords, 'k-', linewidth=0.5, alpha=0.6)
+    
+    _mark_roi_center(ax_roi_top, x, y, roi)
+    
+    # ============ BOTTOM VIEW OF ROI WITH POLYGONS ============
+    ax_roi_bottom = fig.add_subplot(gs[1, 1], label="bottom_map")
+    roi_bottom = roi_transcripts.filter(pl.col("z") < pl.col("z_center"))[::-1]
+    _plot_tissue_scatter(
+        ax_roi_bottom,
+        roi_bottom["x"],
+        roi_bottom["y"],
+        roi_bottom["RGB"].to_numpy(),
+        title="ROI celltype map, bottom",
+        **roi_scatter_kwargs,
+    )
+    
+    # Add polygons on bottom view
+    for idx, row in gdf_roi.iterrows():
+        geom = row.geometry
+        if geom.geom_type == 'Polygon':
+            x_coords, y_coords = geom.exterior.xy
+            ax_roi_bottom.plot(x_coords, y_coords, 'k-', linewidth=0.5, alpha=0.6)
+        elif geom.geom_type == 'MultiPolygon':
+            for poly in geom.geoms:
+                x_coords, y_coords = poly.exterior.xy
+                ax_roi_bottom.plot(x_coords, y_coords, 'k-', linewidth=0.5, alpha=0.6)
+    
+    _mark_roi_center(ax_roi_bottom, x, y, roi)
+    
+    # Side views
+    roi_side_scatter_kwargs = dict(s=10, alpha=0.5)
+    sub_gs = gs[1, 2].subgridspec(2, 1)
+    
+    ax_side_x = fig.add_subplot(sub_gs[0, 0], label="x_cut")
+    roi_side_x = roi_transcripts.filter(pl.col("y") < (y + 4), pl.col("y") > (y - 4))
+    _plot_tissue_scatter(
+        ax_side_x,
+        roi_side_x["x"],
+        roi_side_x["z"],
+        roi_side_x["RGB"].to_numpy(),
+        title="ROI, vertical, x-cut",
+        **roi_side_scatter_kwargs,
+    )
+    
+    ax_side_y = fig.add_subplot(sub_gs[1, 0], label="y_cut")
+    roi_side_y = roi_transcripts.filter(pl.col("x") < (x + 4), pl.col("x") > (x - 4))
+    _plot_tissue_scatter(
+        ax_side_y,
+        roi_side_y["y"],
+        roi_side_y["z"],
+        roi_side_y["RGB"].to_numpy(),
+        title="ROI, vertical, y-cut",
+        **roi_side_scatter_kwargs,
+    )
+    
+    fig.tight_layout()
+    
     return fig
